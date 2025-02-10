@@ -248,6 +248,7 @@ export class AppContext {
       actorStore,
       imageUrlBuilder,
       backgroundQueue,
+      mailer,
       cfg.db.accountDbLoc,
       jwtSecretKey,
       cfg.service.did,

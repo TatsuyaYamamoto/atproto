@@ -131,11 +131,16 @@ export {
   type OAuthAuthorizationServerMetadata,
 }
 
+export type ErrorHandler<
+  Req extends IncomingMessage = IncomingMessage,
+  Res extends ServerResponse = ServerResponse,
+> = (req: Req, res: Res, err: unknown, message: string) => void
+
 export type RouterOptions<
   Req extends IncomingMessage = IncomingMessage,
   Res extends ServerResponse = ServerResponse,
 > = {
-  onError?: (req: Req, res: Res, err: unknown, message: string) => void
+  onError?: ErrorHandler<Req, Res>
 }
 
 export type OAuthProviderOptions = Override<
@@ -471,7 +476,7 @@ export class OAuthProvider extends OAuthVerifier {
         .parseAsync(query.request_uri, { path: ['query', 'request_uri'] })
         .catch(throwInvalidRequest)
 
-      return this.requestManager.get(requestUri, client.id, deviceId)
+      return this.requestManager.get(requestUri, deviceId, client.id)
     }
 
     if ('request' in query) {
@@ -515,11 +520,11 @@ export class OAuthProvider extends OAuthVerifier {
   }
 
   private async deleteRequest(
-    uri: RequestUri,
+    requestUri: RequestUri,
     parameters: OAuthAuthorizationRequestParameters,
   ) {
     try {
-      await this.requestManager.delete(uri)
+      await this.requestManager.delete(requestUri)
     } catch (err) {
       throw AccessDeniedError.from(parameters, err)
     }
@@ -690,18 +695,17 @@ export class OAuthProvider extends OAuthVerifier {
 
   protected async signIn(
     deviceId: DeviceId,
-    uri: RequestUri,
-    clientId: ClientId,
+    requestUri: RequestUri,
     credentials: SignInCredentials,
   ): Promise<{
     account: Account
     consentRequired: boolean
   }> {
-    const client = await this.clientManager.getClient(clientId)
-
     // Ensure the request is still valid (and update the request expiration)
     // @TODO use the returned scopes to determine if consent is required
-    await this.requestManager.get(uri, clientId, deviceId)
+    const { clientId } = await this.requestManager.get(requestUri, deviceId)
+
+    const client = await this.clientManager.getClient(clientId)
 
     const { account, info } = await this.accountManager.signIn(
       credentials,
@@ -721,18 +725,17 @@ export class OAuthProvider extends OAuthVerifier {
 
   protected async acceptRequest(
     deviceId: DeviceId,
-    uri: RequestUri,
-    clientId: ClientId,
+    requestUri: RequestUri,
     sub: string,
   ): Promise<AuthorizationResultRedirect> {
     const { issuer } = this
-    const client = await this.clientManager.getClient(clientId)
 
-    const { parameters, clientAuth } = await this.requestManager.get(
-      uri,
-      clientId,
+    const { parameters, clientId, clientAuth } = await this.requestManager.get(
+      requestUri,
       deviceId,
     )
+
+    const client = await this.clientManager.getClient(clientId)
 
     try {
       const { account, info } = await this.accountManager.get(deviceId, sub)
@@ -747,7 +750,7 @@ export class OAuthProvider extends OAuthVerifier {
 
       const code = await this.requestManager.setAuthorized(
         client,
-        uri,
+        requestUri,
         deviceId,
         account,
       )
@@ -761,7 +764,7 @@ export class OAuthProvider extends OAuthVerifier {
 
       return { issuer, parameters, redirect: { code } }
     } catch (err) {
-      await this.deleteRequest(uri, parameters)
+      await this.deleteRequest(requestUri, parameters)
 
       throw AccessDeniedError.from(parameters, err)
     }
@@ -769,16 +772,16 @@ export class OAuthProvider extends OAuthVerifier {
 
   protected async rejectRequest(
     deviceId: DeviceId,
-    uri: RequestUri,
+    requestUri: RequestUri,
     clientId: ClientId,
   ): Promise<AuthorizationResultRedirect> {
     const { parameters } = await this.requestManager.get(
-      uri,
-      clientId,
+      requestUri,
       deviceId,
+      clientId,
     )
 
-    await this.deleteRequest(uri, parameters)
+    await this.deleteRequest(requestUri, parameters)
 
     return {
       issuer: this.issuer,
@@ -1009,13 +1012,14 @@ export class OAuthProvider extends OAuthVerifier {
 
     // Utils
 
-    const csrfCookie = (uri: RequestUri) => `csrf-${uri}`
-    const onError =
+    const csrfCookie = (requestUri: RequestUri) => `csrf-${requestUri}`
+    const onError: null | ErrorHandler<Req, Res> =
       options?.onError ??
       (process.env['NODE_ENV'] === 'development'
-        ? (req, res, err, msg): void =>
+        ? (req, res, err, msg) => {
             console.error(`OAuthProvider error (${msg}):`, err)
-        : undefined)
+          }
+        : null)
 
     /**
      * Creates a middleware that will serve static JSON content.
@@ -1023,9 +1027,6 @@ export class OAuthProvider extends OAuthVerifier {
     const staticJson = (json: unknown): Middleware<void, Req, Res> =>
       combineMiddlewares([
         function (req, res, next) {
-          res.setHeader('Access-Control-Allow-Origin', '*')
-          res.setHeader('Access-Control-Allow-Headers', '*')
-
           res.setHeader('Cache-Control', 'max-age=300')
           next()
         },
@@ -1041,9 +1042,6 @@ export class OAuthProvider extends OAuthVerifier {
       status?: number,
     ): Handler<T, TReq, TRes> =>
       async function (req, res) {
-        res.setHeader('Access-Control-Allow-Origin', '*')
-        res.setHeader('Access-Control-Allow-Headers', '*')
-
         // https://www.rfc-editor.org/rfc/rfc6749.html#section-5.1
         res.setHeader('Cache-Control', 'no-store')
         res.setHeader('Pragma', 'no-cache')
@@ -1092,15 +1090,64 @@ export class OAuthProvider extends OAuthVerifier {
         }
       }
 
+    const apiHandler = <
+      T,
+      TReq extends Req,
+      TRes extends Res,
+      S extends z.ZodTypeAny,
+      Json,
+    >(
+      inputSchema: S,
+      buildJson: (
+        this: T,
+        req: TReq,
+        res: TRes,
+        input: z.infer<S>,
+        context: {
+          deviceId: DeviceId
+          requestUri: RequestUri
+        },
+      ) => Json | Promise<Json>,
+      status?: number,
+    ) => {
+      return jsonHandler<T, TReq, TRes, Json>(async function (req, res) {
+        validateFetchMode(req, res, ['same-origin'])
+        validateFetchSite(req, res, ['same-origin'])
+        validateSameOrigin(req, res, issuerOrigin)
+        const referer = validateReferer(req, res, {
+          origin: issuerOrigin,
+          pathname: '/oauth/authorize',
+        })
+
+        const requestUri = await requestUriSchema.parseAsync(
+          referer.searchParams.get('request_uri'),
+          { path: ['query', 'request_uri'] },
+        )
+
+        validateCsrfToken(
+          req,
+          res,
+          req.headers['x-csrf-token'],
+          csrfCookie(requestUri),
+        )
+
+        const { deviceId } = await deviceManager.load(req, res)
+
+        const payload = await parseHttpRequest(req, ['json'])
+        const input = await inputSchema.parseAsync(payload, { path: ['body'] })
+
+        return buildJson.call(this, req, res, input, { deviceId, requestUri })
+      }, status)
+    }
+
     const navigationHandler = <T, TReq extends Req, TRes extends Res>(
       handler: (this: T, req: TReq, res: TRes) => void | Promise<void>,
     ): Handler<T, TReq, TRes> =>
       async function (req, res) {
-        res.setHeader('Access-Control-Allow-Origin', '*')
-        res.setHeader('Access-Control-Allow-Headers', '*')
-
         res.setHeader('Cache-Control', 'no-store')
         res.setHeader('Pragma', 'no-cache')
+
+        res.setHeader('Referrer-Policy', 'same-origin')
 
         try {
           validateFetchMode(req, res, ['navigate'])
@@ -1146,46 +1193,70 @@ export class OAuthProvider extends OAuthVerifier {
       throw err
     }
 
+    // CORS preflight
+    const corsHeaders: Middleware = function (req, res, next) {
+      res.setHeader('Access-Control-Max-Age', '86400') // 1 day
+
+      // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+      //
+      // > For requests without credentials, the literal value "*" can be
+      // > specified as a wildcard; the value tells browsers to allow
+      // > requesting code from any origin to access the resource.
+      // > Attempting to use the wildcard with credentials results in an
+      // > error.
+      //
+      // A "*" is safer to use than reflecting the request origin.
+      res.setHeader('Access-Control-Allow-Origin', '*')
+
+      // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Methods
+      // > The value "*" only counts as a special wildcard value for
+      // > requests without credentials (requests without HTTP cookies or
+      // > HTTP authentication information). In requests with credentials,
+      // > it is treated as the literal method name "*" without special
+      // > semantics.
+      res.setHeader('Access-Control-Allow-Methods', '*')
+
+      next()
+    }
+
+    const corsPreflight: Middleware = combineMiddlewares([
+      corsHeaders,
+      function (req, res, _next) {
+        res.writeHead(204).end()
+      },
+    ])
+
     //- Public OAuth endpoints
 
     router.get(
       '/.well-known/oauth-authorization-server',
+      corsHeaders,
       staticJson(server.metadata),
     )
 
-    // CORS preflight
-    const corsPreflight: Middleware = function (req, res, _next) {
-      res
-        .writeHead(204, {
-          // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-          //
-          // > For requests without credentials, the literal value "*" can be
-          // > specified as a wildcard; the value tells browsers to allow
-          // > requesting code from any origin to access the resource.
-          // > Attempting to use the wildcard with credentials results in an
-          // > error.
-          //
-          // A "*" is safer to use than reflecting the request origin.
-          'Access-Control-Allow-Origin': '*',
-          // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Methods
-          // > The value "*" only counts as a special wildcard value for
-          // > requests without credentials (requests without HTTP cookies or
-          // > HTTP authentication information). In requests with credentials,
-          // > it is treated as the literal method name "*" without special
-          // > semantics.
-          'Access-Control-Allow-Methods': '*',
-          'Access-Control-Allow-Headers': 'Content-Type,Authorization,DPoP',
-          'Access-Control-Max-Age': '86400', // 1 day
-        })
-        .end()
-    }
+    router.get('/oauth/jwks', corsHeaders, staticJson(server.jwks))
 
-    router.get('/oauth/jwks', staticJson(server.jwks))
-
-    router.options('/oauth/par', corsPreflight)
-    router.post(
+    router.options(
       '/oauth/par',
-      jsonHandler(async function (req, _res) {
+      (req, res, next) => {
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,DPoP')
+        next()
+      },
+      corsPreflight,
+    )
+    router.all(
+      '/oauth/par',
+      corsHeaders,
+      (req, res, next) => {
+        // https://datatracker.ietf.org/doc/html/rfc9126#section-2.3
+        // > If the request did not use the POST method, the authorization
+        // > server responds with an HTTP 405 (Method Not Allowed) status code.
+        if (req.method === 'POST') next()
+        else res.writeHead(405).end()
+      },
+      jsonHandler(async function (req, res) {
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,DPoP')
+
         const payload = await parseHttpRequest(req, ['json', 'urlencoded'])
 
         const credentials = await oauthClientCredentialsSchema
@@ -1210,17 +1281,10 @@ export class OAuthProvider extends OAuthVerifier {
       }, 201),
     )
 
-    // https://datatracker.ietf.org/doc/html/rfc9126#section-2.3
-    // > If the request did not use the POST method, the authorization server
-    // > responds with an HTTP 405 (Method Not Allowed) status code.
-    router.options('/oauth/par', corsPreflight)
-    router.all('/oauth/par', (req, res) => {
-      res.writeHead(405).end()
-    })
-
     router.options('/oauth/token', corsPreflight)
     router.post(
       '/oauth/token',
+      corsHeaders,
       jsonHandler(async function (req, _res) {
         const payload = await parseHttpRequest(req, ['json', 'urlencoded'])
 
@@ -1245,6 +1309,7 @@ export class OAuthProvider extends OAuthVerifier {
     router.options('/oauth/revoke', corsPreflight)
     router.post(
       '/oauth/revoke',
+      corsHeaders,
       jsonHandler(async function (req, res) {
         const payload = await parseHttpRequest(req, ['json', 'urlencoded'])
 
@@ -1260,7 +1325,6 @@ export class OAuthProvider extends OAuthVerifier {
       }),
     )
 
-    router.options('/oauth/revoke', corsPreflight)
     router.get(
       '/oauth/revoke',
       navigationHandler(async function (req, res) {
@@ -1285,8 +1349,10 @@ export class OAuthProvider extends OAuthVerifier {
       }),
     )
 
+    router.options('/oauth/introspect', corsPreflight)
     router.post(
       '/oauth/introspect',
+      corsHeaders,
       jsonHandler(async function (req, _res) {
         const payload = await parseHttpRequest(req, ['json', 'urlencoded'])
 
@@ -1314,7 +1380,7 @@ export class OAuthProvider extends OAuthVerifier {
         const query = Object.fromEntries(this.url.searchParams)
 
         const credentials = await oauthClientCredentialsSchema
-          .parseAsync(query, { path: ['body'] })
+          .parseAsync(query, { path: ['query'] })
           .catch(throwInvalidRequest)
 
         if ('client_secret' in credentials) {
@@ -1327,17 +1393,19 @@ export class OAuthProvider extends OAuthVerifier {
 
         const { deviceId } = await deviceManager.load(req, res)
 
-        const data = await server
+        const result:
+          | AuthorizationResultRedirect
+          | AuthorizationResultAuthorize = await server
           .authorize(deviceId, credentials, authorizationRequest)
           .catch((err) => accessDeniedToRedirectCatcher(req, res, err))
 
         switch (true) {
-          case 'redirect' in data: {
-            return sendAuthorizeRedirect(res, data)
+          case 'redirect' in result: {
+            return sendAuthorizeRedirect(res, result)
           }
-          case 'authorize' in data: {
-            await setupCsrfToken(req, res, csrfCookie(data.authorize.uri))
-            return outputManager.sendAuthorizePage(res, data)
+          case 'authorize' in result: {
+            await setupCsrfToken(req, res, csrfCookie(result.authorize.uri))
+            return outputManager.sendAuthorizePage(res, result)
           }
           default: {
             // Should never happen
@@ -1347,51 +1415,53 @@ export class OAuthProvider extends OAuthVerifier {
       }),
     )
 
-    const signInPayloadSchema = z.object({
-      csrf_token: z.string(),
-      request_uri: requestUriSchema,
-      client_id: clientIdSchema,
-      credentials: signInCredentialsSchema,
-    })
-
-    router.options('/oauth/authorize/sign-in', corsPreflight)
     router.post(
       '/oauth/authorize/sign-in',
-      jsonHandler(async function (req, res) {
-        validateFetchMode(req, res, ['same-origin'])
-        validateFetchSite(req, res, ['same-origin'])
-        validateSameOrigin(req, res, issuerOrigin)
+      apiHandler(
+        z //
+          .object({ credentials: signInCredentialsSchema })
+          .strict(),
+        async function (req, res, { credentials }, { deviceId, requestUri }) {
+          return server.signIn(deviceId, requestUri, credentials)
+        },
+      ),
+    )
 
-        const payload = await parseHttpRequest(req, ['json'])
-        const input = await signInPayloadSchema.parseAsync(payload, {
-          path: ['body'],
-        })
+    router.post(
+      '/oauth/authorize/reset-password-request',
+      apiHandler(
+        z //
+          .object({ email: z.string().email() })
+          .strict(),
+        async function (req, res, { email }, { deviceId }) {
+          await server.accountManager.resetPasswordRequest(deviceId, email)
+        },
+      ),
+    )
 
-        validateReferer(req, res, {
-          origin: issuerOrigin,
-          pathname: '/oauth/authorize',
-        })
-        validateCsrfToken(
-          req,
-          res,
-          input.csrf_token,
-          csrfCookie(input.request_uri),
-        )
-
-        const { deviceId } = await deviceManager.load(req, res, true)
-
-        return server.signIn(
-          deviceId,
-          input.request_uri,
-          input.client_id,
-          input.credentials,
-        )
-      }),
+    const emailTokenSchema = z.string().regex(/^[A-Z2-7]{5}-[A-Z2-7]{5}$/)
+    const passwordSchema = z.string().min(8)
+    router.post(
+      '/oauth/authorize/reset-password-confirm',
+      apiHandler(
+        z //
+          .object({
+            token: emailTokenSchema,
+            password: passwordSchema,
+          })
+          .strict(),
+        async function (req, res, input, { deviceId }) {
+          await server.accountManager.resetPasswordConfirm(
+            deviceId,
+            input.token,
+            input.password,
+          )
+        },
+      ),
     )
 
     const acceptQuerySchema = z.object({
       csrf_token: z.string(),
-      request_uri: requestUriSchema,
       client_id: clientIdSchema,
       account_sub: z.string(),
     })
@@ -1415,31 +1485,28 @@ export class OAuthProvider extends OAuthVerifier {
           path: ['query'],
         })
 
-        validateReferer(req, res, {
+        const referer = validateReferer(req, res, {
           origin: issuerOrigin,
           pathname: '/oauth/authorize',
-          searchParams: [
-            ['request_uri', input.request_uri],
-            ['client_id', input.client_id],
-          ],
+          searchParams: [['client_id', input.client_id]],
         })
+
+        const requestUri = await requestUriSchema.parseAsync(
+          referer.searchParams.get('request_uri'),
+        )
+
         validateCsrfToken(
           req,
           res,
           input.csrf_token,
-          csrfCookie(input.request_uri),
+          csrfCookie(requestUri),
           true,
         )
 
         const { deviceId } = await deviceManager.load(req, res)
 
         const data = await server
-          .acceptRequest(
-            deviceId,
-            input.request_uri,
-            input.client_id,
-            input.account_sub,
-          )
+          .acceptRequest(deviceId, requestUri, input.account_sub)
           .catch((err) => accessDeniedToRedirectCatcher(req, res, err))
 
         return await sendAuthorizeRedirect(res, data)
@@ -1448,7 +1515,6 @@ export class OAuthProvider extends OAuthVerifier {
 
     const rejectQuerySchema = z.object({
       csrf_token: z.string(),
-      request_uri: requestUriSchema,
       client_id: clientIdSchema,
     })
 
@@ -1471,26 +1537,28 @@ export class OAuthProvider extends OAuthVerifier {
           path: ['query'],
         })
 
-        validateReferer(req, res, {
+        const referer = validateReferer(req, res, {
           origin: issuerOrigin,
           pathname: '/oauth/authorize',
-          searchParams: [
-            ['request_uri', input.request_uri],
-            ['client_id', input.client_id],
-          ],
+          searchParams: [['client_id', input.client_id]],
         })
+
+        const requestUri = await requestUriSchema.parseAsync(
+          referer.searchParams.get('request_uri'),
+        )
+
         validateCsrfToken(
           req,
           res,
           input.csrf_token,
-          csrfCookie(input.request_uri),
+          csrfCookie(requestUri),
           true,
         )
 
         const { deviceId } = await deviceManager.load(req, res)
 
         const data = await server
-          .rejectRequest(deviceId, input.request_uri, input.client_id)
+          .rejectRequest(deviceId, requestUri, input.client_id)
           .catch((err) => accessDeniedToRedirectCatcher(req, res, err))
 
         return await sendAuthorizeRedirect(res, data)

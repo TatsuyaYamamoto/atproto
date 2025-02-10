@@ -30,6 +30,7 @@ import { BackgroundQueue } from '../background'
 import { softDeleted } from '../db'
 import { ImageUrlBuilder } from '../image/image-url-builder'
 import { StatusAttr } from '../lexicon/types/com/atproto/admin/defs'
+import { ServerMailer } from '../mailer'
 import { AccountDb, EmailTokenPurpose, getDb, getMigrator } from './db'
 import * as account from './helpers/account'
 import { AccountStatus, ActorAccount } from './helpers/account'
@@ -56,6 +57,7 @@ export class AccountManager
     private actorStore: ActorStore,
     private imageUrlBuilder: ImageUrlBuilder,
     private backgroundQueue: BackgroundQueue,
+    private mailer: ServerMailer,
     dbLocation: string,
     private jwtKey: KeyObject,
     private serviceDid: string,
@@ -529,8 +531,8 @@ export class AccountManager
   }
 
   async authenticateAccount(
-    { username: identifier, password, remember = false }: SignInCredentials,
     deviceId: DeviceId,
+    { username: identifier, password, remember = false }: SignInCredentials,
   ): Promise<AccountInfo | null> {
     try {
       const { user, appPassword } = await this.login({ identifier, password })
@@ -604,6 +606,27 @@ export class AccountManager
     await this.db.executeWithRetry(
       deviceAccount.removeQB(this.db, deviceId, sub),
     )
+  }
+
+  async resetPasswordRequest(deviceId: DeviceId, email: string): Promise<void> {
+    const account = await this.getAccountByEmail(email, {
+      includeDeactivated: true,
+      includeTakenDown: true,
+    })
+
+    if (!account?.email) return
+
+    const token = await this.createEmailToken(account.did, 'reset_password')
+
+    await this.mailer.sendConfirmEmail({ token }, { to: account.email })
+  }
+
+  async resetPasswordConfirm(
+    deviceId: DeviceId,
+    token: string,
+    password: string,
+  ): Promise<void> {
+    await this.resetPassword({ password, token })
   }
 
   // RequestStore

@@ -5,19 +5,21 @@ import { Awaitable } from '../lib/util/type.js'
 import { Sub } from '../oidc/sub.js'
 import { Account } from './account.js'
 
-export const signInCredentialsSchema = z.object({
-  username: z.string(),
-  password: z.string(),
+export const signInCredentialsSchema = z
+  .object({
+    username: z.string(),
+    password: z.string(),
 
-  /**
-   * If false, the account must not be returned from
-   * {@link AccountStore.listDeviceAccounts}. Note that this only makes sense when
-   * used with a device ID.
-   */
-  remember: z.boolean().optional().default(false),
+    /**
+     * If false, the account must not be returned from
+     * {@link AccountStore.listDeviceAccounts}. Note that this only makes sense when
+     * used with a device ID.
+     */
+    remember: z.boolean().optional().default(false),
 
-  emailOtp: z.string().optional(),
-})
+    emailOtp: z.string().optional(),
+  })
+  .strict()
 
 export type SignInCredentials = z.TypeOf<typeof signInCredentialsSchema>
 
@@ -37,8 +39,8 @@ export type AccountInfo = {
 
 export interface AccountStore {
   authenticateAccount(
-    credentials: SignInCredentials,
     deviceId: DeviceId,
+    credentials: SignInCredentials,
   ): Awaitable<AccountInfo | null>
 
   addAuthorizedClient(
@@ -55,6 +57,13 @@ export interface AccountStore {
    * be returned. The others will be ignored.
    */
   listDeviceAccounts(deviceId: DeviceId): Awaitable<AccountInfo[]>
+
+  resetPasswordRequest(deviceId: DeviceId, email: string): Awaitable<void>
+  resetPasswordConfirm(
+    deviceId: DeviceId,
+    token: string,
+    password: string,
+  ): Awaitable<void>
 }
 
 export function isAccountStore(
@@ -65,7 +74,9 @@ export function isAccountStore(
     typeof implementation.getDeviceAccount === 'function' &&
     typeof implementation.addAuthorizedClient === 'function' &&
     typeof implementation.listDeviceAccounts === 'function' &&
-    typeof implementation.removeDeviceAccount === 'function'
+    typeof implementation.removeDeviceAccount === 'function' &&
+    typeof implementation.resetPasswordRequest === 'function' &&
+    typeof implementation.resetPasswordConfirm === 'function'
   )
 }
 

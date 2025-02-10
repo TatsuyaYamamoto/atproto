@@ -22,7 +22,7 @@ export class AccountManager {
     deviceId: DeviceId,
   ): Promise<AccountInfo> {
     return constantTime(TIMING_ATTACK_MITIGATION_DELAY, async () => {
-      const result = await this.store.authenticateAccount(credentials, deviceId)
+      const result = await this.store.authenticateAccount(deviceId, credentials)
       if (result) return result
 
       throw new InvalidRequestError('Invalid credentials')
@@ -51,5 +51,21 @@ export class AccountManager {
   public async list(deviceId: DeviceId): Promise<AccountInfo[]> {
     const results = await this.store.listDeviceAccounts(deviceId)
     return results.filter((result) => result.info.remembered)
+  }
+
+  public async resetPasswordRequest(deviceId: DeviceId, email: string) {
+    return constantTime(TIMING_ATTACK_MITIGATION_DELAY, async () => {
+      await this.store.resetPasswordRequest(deviceId, email)
+    })
+  }
+
+  public async resetPasswordConfirm(
+    deviceId: DeviceId,
+    token: string,
+    newPassword: string,
+  ) {
+    return constantTime(TIMING_ATTACK_MITIGATION_DELAY, async () => {
+      await this.store.resetPasswordConfirm(deviceId, token, newPassword)
+    })
   }
 }

@@ -82,6 +82,18 @@ export function validateReferer(
   req: IncomingMessage,
   res: ServerResponse,
   reference: UrlReference,
+  allowNull: true,
+): URL | null
+export function validateReferer(
+  req: IncomingMessage,
+  res: ServerResponse,
+  reference: UrlReference,
+  allowNull?: false,
+): URL
+export function validateReferer(
+  req: IncomingMessage,
+  res: ServerResponse,
+  reference: UrlReference,
   allowNull = false,
 ) {
   const referer = req.headers['referer']
@@ -89,6 +101,7 @@ export function validateReferer(
   if (refererUrl ? !urlMatch(refererUrl, reference) : !allowNull) {
     throw createHttpError(400, `Invalid referer ${referer}`)
   }
+  return refererUrl
 }
 
 export async function setupCsrfToken(
@@ -125,12 +138,13 @@ export function validateSameOrigin(
 export function validateCsrfToken(
   req: IncomingMessage,
   res: ServerResponse,
-  csrfToken: string,
+  csrfToken: unknown,
   cookieName = 'csrf_token',
   clearCookie = false,
 ) {
   const cookies = parseHttpCookies(req)
   if (
+    typeof csrfToken !== 'string' ||
     !csrfToken ||
     !cookies ||
     !cookieName ||

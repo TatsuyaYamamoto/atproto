@@ -21,7 +21,6 @@ export type SignUpData = {
 export function useApi(
   {
     clientId,
-    requestUri,
     csrfCookie,
     sessions: initialSessions,
     newSessionsRequireConsent,
@@ -47,8 +46,8 @@ export function useApi(
   )
 
   const api = useMemo(
-    () => new Api(requestUri, clientId, csrfToken, newSessionsRequireConsent),
-    [requestUri, clientId, csrfToken, newSessionsRequireConsent],
+    () => new Api(csrfToken, newSessionsRequireConsent),
+    [csrfToken, newSessionsRequireConsent],
   )
 
   const performRedirect = useCallback(
@@ -74,8 +73,23 @@ export function useApi(
     [api, performRedirect, clientId, setSessions],
   )
 
+  const doInitiatePasswordReset = useCallback(
+    async (email: string): Promise<void> => {
+      await api.resetPasswordRequest(email)
+    },
+    [api],
+  )
+
+  const doConfirmResetPassword = useCallback(
+    async (token: string, password: string): Promise<void> => {
+      await api.resetPasswordConfirm(token, password)
+    },
+    [api],
+  )
+
   const doSignUp = useCallback(
-    (_data: SignUpData) => {
+    (data: SignUpData): Promise<void> => {
+      console.error('SIGNUP', data)
       //
       throw new Error('Not implemented')
     },
@@ -98,6 +112,8 @@ export function useApi(
     setSession,
 
     doSignIn,
+    doInitiatePasswordReset,
+    doConfirmResetPassword,
     doSignUp,
     doAccept,
     doReject,

@@ -306,8 +306,8 @@ export class RequestManager {
 
   async get(
     uri: RequestUri,
-    clientId: ClientId,
     deviceId: DeviceId,
+    clientId?: ClientId,
   ): Promise<RequestInfo> {
     const id = decodeRequestUri(uri)
 
@@ -334,7 +334,7 @@ export class RequestManager {
         )
       }
 
-      if (data.clientId !== clientId) {
+      if (clientId != null && data.clientId !== clientId) {
         throw new AccessDeniedError(
           data.parameters,
           'This request was initiated for another client',

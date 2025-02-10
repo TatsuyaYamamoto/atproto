@@ -1,72 +1,81 @@
-import { FetchResponseError, Json } from '@atproto-labs/fetch'
+import { FetchResponseError, Json, peekJson } from '@atproto-labs/fetch'
 import { Account, Session } from '../backend-data'
 
 export class Api {
   constructor(
-    private requestUri: string,
-    private clientId: string,
     private csrfToken: string,
     private newSessionsRequireConsent: boolean,
   ) {}
+
+  async fetch<R extends Json | void = Json | void>(
+    path: `/${string}`,
+    payload: Json,
+  ): Promise<R> {
+    const response = await fetch(`/oauth/authorize${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': this.csrfToken,
+      },
+      mode: 'same-origin',
+      body: JSON.stringify(payload),
+    })
+
+    if (response.ok) {
+      try {
+        if (response.status === 204) return undefined as R
+        return (await response.json()) as R
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : undefined
+        throw new FetchResponseError(response, undefined, message, { cause })
+      }
+    }
+
+    try {
+      const json = await peekJson(response).catch(() => undefined)
+
+      if (response.status === 400 && isInvalidCredentials(json)) {
+        throw new InvalidCredentialsError()
+      } else if (response.status === 401 && isSecondFactorRequired(json)) {
+        throw new SecondAuthenticationFactorRequiredError(json.type, json.hint)
+      } else {
+        throw await FetchResponseError.from(response)
+      }
+    } finally {
+      response.body?.cancel()
+    }
+  }
 
   async signIn(credentials: {
     username: string
     password: string
     remember?: boolean
   }): Promise<Session> {
-    const response = await fetch('/oauth/authorize/sign-in', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      mode: 'same-origin',
-      body: JSON.stringify({
-        csrf_token: this.csrfToken,
-        request_uri: this.requestUri,
-        client_id: this.clientId,
-        credentials,
-      }),
-    })
+    const json = await this.fetch<{
+      account: Account
+      consentRequired: boolean
+    }>('/sign-in', { credentials })
 
-    const json: Json = await response.json()
+    return {
+      account: json.account,
 
-    if (response.ok) {
-      const data = json as {
-        account: Account
-        consentRequired: boolean
-      }
-
-      return {
-        account: data.account,
-
-        selected: true,
-        loginRequired: false,
-        consentRequired: this.newSessionsRequireConsent || data.consentRequired,
-      }
-    } else if (
-      response.status === 400 &&
-      json?.['error'] === 'invalid_request' &&
-      json?.['error_description'] === 'Invalid credentials'
-    ) {
-      throw new InvalidCredentialsError()
-    } else if (
-      response.status === 401 &&
-      json?.['error'] === 'second_authentication_factor_required'
-    ) {
-      const data = json as {
-        type: 'emailOtp'
-        hint: string
-      }
-
-      throw new SecondAuthenticationFactorRequiredError(data.type, data.hint)
-    } else {
-      throw new FetchResponseError(response)
+      selected: true,
+      loginRequired: false,
+      consentRequired: this.newSessionsRequireConsent || json.consentRequired,
     }
+  }
+
+  async resetPasswordRequest(email: string) {
+    return this.fetch<void>('/reset-password-request', { email })
+  }
+
+  async resetPasswordConfirm(token: string, password: string) {
+    return this.fetch<void>('/reset-password-confirm', { token, password })
   }
 
   async accept(account: Account): Promise<URL> {
     const url = new URL('/oauth/authorize/accept', window.origin)
-    url.searchParams.set('request_uri', this.requestUri)
     url.searchParams.set('account_sub', account.sub)
-    url.searchParams.set('client_id', this.clientId)
     url.searchParams.set('csrf_token', this.csrfToken)
 
     return url
@@ -74,8 +83,6 @@ export class Api {
 
   async reject(): Promise<URL> {
     const url = new URL('/oauth/authorize/reject', window.origin)
-    url.searchParams.set('request_uri', this.requestUri)
-    url.searchParams.set('client_id', this.clientId)
     url.searchParams.set('csrf_token', this.csrfToken)
 
     return url
@@ -95,4 +102,28 @@ export class SecondAuthenticationFactorRequiredError extends Error {
   ) {
     super(`${type} authentication factor required (hint: ${hint})`)
   }
+}
+
+function isSecondFactorRequired(json: unknown): json is {
+  error: 'second_authentication_factor_required'
+  type: 'emailOtp'
+  hint: string
+} {
+  return (
+    json != null &&
+    json['error'] === 'second_authentication_factor_required' &&
+    json['type'] === 'emailOtp' &&
+    typeof json['hint'] === 'string'
+  )
+}
+
+function isInvalidCredentials(json: unknown): json is {
+  error: 'invalid_request'
+  error_description: 'Invalid credentials'
+} {
+  return (
+    json != null &&
+    json['error'] === 'invalid_request' &&
+    json['error_description'] === 'Invalid credentials'
+  )
 }
